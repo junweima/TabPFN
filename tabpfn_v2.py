@@ -3,8 +3,27 @@ import torch.nn as nn
 from tabpfn.utils import load_model_criterion_config
 from typing import Literal
 from tabpfn.model.bar_distribution import FullSupportBarDistribution
-from functools import partial
-from tabpfn.regressor import _logits_to_output
+
+class EasyBarDist(nn.Module):
+    def __init__(self, borders: torch.Tensor):
+        super().__init__()
+        self.borders = borders
+    
+    @property
+    def bucket_widths(self) -> torch.Tensor:
+        return self.borders[1:] - self.borders[:-1]
+
+    def mean(self, logits: torch.Tensor) -> torch.Tensor:
+        bucket_means = self.borders[:-1] + self.bucket_widths / 2
+        p = torch.softmax(logits, -1)
+        side_normals = (
+            FullSupportBarDistribution.halfnormal_with_p_weight_before(self.bucket_widths[0]),
+            FullSupportBarDistribution.halfnormal_with_p_weight_before(self.bucket_widths[-1]),
+        )
+        bucket_means[0] = -side_normals[0].mean + self.borders[1]
+        bucket_means[-1] = side_normals[1].mean + self.borders[-2]
+
+        return torch.einsum("lbc,cb->lb", p, bucket_means.to(logits.device).type(logits.dtype))
 
 class EasyTabPFNV2(nn.Module):
     def __init__(self, task: Literal["cls", "reg"], seed: int = 42):
@@ -43,14 +62,12 @@ class EasyTabPFNV2(nn.Module):
         x_src, y_src = x_src.transpose(0, 1), y_src.transpose(0, 1)
         if task == "reg":
             # Standardize y
-            mean = torch.mean(y_src, dim=0)
-            std = torch.std(y_src, dim=0)
-            self.y_train_std_ = std.item() + 1e-20
-            self.y_train_mean_ = mean.item()
-            y_src = (y_src - self.y_train_mean_) / self.y_train_std_
-            self.renormalized_criterion_ = FullSupportBarDistribution(
-                self.bardist_.borders * self.y_train_std_ + self.y_train_mean_,
-            ).float()
+            mean = torch.mean(y_src, dim=0, keepdim=True)
+            std = torch.std(y_src, dim=0, keepdim=True)
+            y_src = (y_src - mean) / std
+            self.renormalized_criterion_ = EasyBarDist(
+                self.bardist_.borders[:, None] * std + mean,
+            )
         
         output = self.model(train_x=x_src[:eval_pos], train_y=y_src, test_x=x_src[eval_pos:])
 
@@ -116,13 +133,16 @@ if __name__ == '__main__':
     X_train, X_test, y_train = torch.Tensor(X_train).unsqueeze(0), torch.Tensor(X_test).unsqueeze(0), torch.Tensor(y_train).unsqueeze(0)
     X_train, X_test, y_train = X_train.cuda(), X_test.cuda(), y_train.cuda()
 
+    X_train, X_test, y_train = X_train.repeat(16, 1, 1), X_test.repeat(16, 1, 1), y_train.repeat(16, 1)
+
     # Initialize a regressor
     reg = EasyTabPFNV2("reg")
     reg.to('cuda:0')
 
     # Predict a point estimate (using the mean)
-    predictions = reg(torch.cat([X_train, X_test], dim=1), y_train, task="reg").detach().cpu().numpy().squeeze(0)
+    predictions = reg(torch.cat([X_train, X_test], dim=1), y_train, task="reg").detach().cpu().numpy().squeeze()[0]
 
     print("Mean Squared Error (MSE):", mean_squared_error(y_test, predictions))
     print("Mean Absolute Error (MAE):", mean_absolute_error(y_test, predictions))
     print("R-squared (R^2):", r2_score(y_test, predictions))
+
