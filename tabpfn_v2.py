@@ -2,6 +2,9 @@ import torch
 import torch.nn as nn
 from tabpfn.utils import load_model_criterion_config
 from typing import Literal
+from tabpfn.model.bar_distribution import FullSupportBarDistribution
+from functools import partial
+from tabpfn.regressor import _logits_to_output
 
 class EasyTabPFNV2(nn.Module):
     def __init__(self, task: Literal["cls", "reg"], seed: int = 42):
@@ -17,9 +20,8 @@ class EasyTabPFNV2(nn.Module):
                 download=True,
                 model_seed=42,
             )
-            self.bar_distribution = None
         else:
-            self.model, bardist, _ = load_model_criterion_config(
+            self.model, self.bardist_, _ = load_model_criterion_config(
                 model_path="/home/jeremy/.cache/tabpfn/tabpfn-v2-regressor.ckpt",
                 check_bar_distribution_criterion=True,
                 cache_trainset_representation=False,
@@ -28,7 +30,6 @@ class EasyTabPFNV2(nn.Module):
                 download=True,
                 model_seed=seed,
             )
-            self.bar_distribution = bardist
 
     def forward(
         self,
@@ -40,15 +41,30 @@ class EasyTabPFNV2(nn.Module):
         
         # switch from batch first to batch second
         x_src, y_src = x_src.transpose(0, 1), y_src.transpose(0, 1)
+        if task == "reg":
+            # Standardize y
+            mean = torch.mean(y_src, dim=0)
+            std = torch.std(y_src, dim=0)
+            self.y_train_std_ = std.item() + 1e-20
+            self.y_train_mean_ = mean.item()
+            y_src = (y_src - self.y_train_mean_) / self.y_train_std_
+            self.renormalized_criterion_ = FullSupportBarDistribution(
+                self.bardist_.borders * self.y_train_std_ + self.y_train_mean_,
+            ).float()
+        
         output = self.model(train_x=x_src[:eval_pos], train_y=y_src, test_x=x_src[eval_pos:])
-        output = output.transpose(0, 1)
 
+        if task == "reg":
+            output = self.renormalized_criterion_.mean(output)
+        
+        output = output.transpose(0, 1)
         return output
 
 
 if __name__ == '__main__':
-    from sklearn.datasets import load_iris, load_breast_cancer
+    from sklearn.datasets import load_iris, load_breast_cancer, load_diabetes
     from sklearn.metrics import accuracy_score, roc_auc_score
+    from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
     from sklearn.model_selection import train_test_split
 
     # test binary classification
@@ -87,3 +103,26 @@ if __name__ == '__main__':
     print("ROC AUC:", roc_auc_score(y_test, prediction_probabilities, multi_class="ovr"))
     predictions = prediction_probabilities.argmax(1)
     print("Accuracy", accuracy_score(y_test, predictions))
+
+    # regression
+    # Load data
+    X, y = load_diabetes(return_X_y=True)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=0.33,
+        random_state=42,
+    )
+    X_train, X_test, y_train = torch.Tensor(X_train).unsqueeze(0), torch.Tensor(X_test).unsqueeze(0), torch.Tensor(y_train).unsqueeze(0)
+    X_train, X_test, y_train = X_train.cuda(), X_test.cuda(), y_train.cuda()
+
+    # Initialize a regressor
+    reg = EasyTabPFNV2("reg")
+    reg.to('cuda:0')
+
+    # Predict a point estimate (using the mean)
+    predictions = reg(torch.cat([X_train, X_test], dim=1), y_train, task="reg").detach().cpu().numpy().squeeze(0)
+
+    print("Mean Squared Error (MSE):", mean_squared_error(y_test, predictions))
+    print("Mean Absolute Error (MAE):", mean_absolute_error(y_test, predictions))
+    print("R-squared (R^2):", r2_score(y_test, predictions))
