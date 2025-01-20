@@ -26,29 +26,27 @@ class EasyBarDist(nn.Module):
         return torch.einsum("lbc,cb->lb", p, bucket_means.to(logits.device).type(logits.dtype))
 
 class EasyTabPFNV2(nn.Module):
-    def __init__(self, task: Literal["cls", "reg"], seed: int = 42):
+    def __init__(self, seed: int = 42):
         super().__init__()
-        self.task = task
-        if task == "cls":
-            self.model, _, _ = load_model_criterion_config(
-                model_path="/home/jeremy/.cache/tabpfn/tabpfn-v2-classifier.ckpt",
-                check_bar_distribution_criterion=False,
-                cache_trainset_representation=False,
-                which="classifier",
-                version="v2",
-                download=True,
-                model_seed=42,
-            )
-        else:
-            self.model, self.bardist_, _ = load_model_criterion_config(
-                model_path="/home/jeremy/.cache/tabpfn/tabpfn-v2-regressor.ckpt",
-                check_bar_distribution_criterion=True,
-                cache_trainset_representation=False,
-                which="regressor",
-                version="v2",
-                download=True,
-                model_seed=seed,
-            )
+        self.cls_model, _, _ = load_model_criterion_config(
+            model_path="/home/jeremy/.cache/tabpfn/tabpfn-v2-classifier.ckpt",
+            check_bar_distribution_criterion=False,
+            cache_trainset_representation=False,
+            which="classifier",
+            version="v2",
+            download=True,
+            model_seed=42,
+        )
+        self.reg_model, self.bardist_, _ = load_model_criterion_config(
+            model_path="/home/jeremy/.cache/tabpfn/tabpfn-v2-regressor.ckpt",
+            check_bar_distribution_criterion=True,
+            cache_trainset_representation=False,
+            which="regressor",
+            version="v2",
+            download=True,
+            model_seed=seed,
+        )
+        self.num_features = 100
 
     def forward(
         self,
@@ -59,7 +57,7 @@ class EasyTabPFNV2(nn.Module):
         eval_pos = y_src.shape[1]
         
         # switch from batch first to batch second
-        x_src, y_src = x_src.transpose(0, 1), y_src.transpose(0, 1)
+        x_src, y_src = x_src.transpose(0, 1), y_src.transpose(0, 1).squeeze()
         if task == "reg":
             # Standardize y
             mean = torch.mean(y_src, dim=0, keepdim=True)
@@ -69,7 +67,8 @@ class EasyTabPFNV2(nn.Module):
                 self.bardist_.borders[:, None] * std + mean,
             )
         
-        output = self.model(train_x=x_src[:eval_pos], train_y=y_src, test_x=x_src[eval_pos:])
+        model = self.cls_model if task == "cls" else self.reg_model
+        output = model(train_x=x_src[:eval_pos], train_y=y_src, test_x=x_src[eval_pos:])
 
         if task == "reg":
             output = self.renormalized_criterion_.mean(output)
