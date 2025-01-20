@@ -3,6 +3,7 @@ import torch.nn as nn
 from tabpfn.utils import load_model_criterion_config
 from typing import Literal
 from tabpfn.model.bar_distribution import FullSupportBarDistribution
+from tabpfn.model.multi_head_attention import MultiHeadAttention
 
 class EasyBarDist(nn.Module):
     def __init__(self, borders: torch.Tensor):
@@ -25,8 +26,34 @@ class EasyBarDist(nn.Module):
 
         return torch.einsum("lbc,cb->lb", p, bucket_means.to(logits.device).type(logits.dtype))
 
+
+def reset_weights_recursively(module):
+    if len(list(module.children())) == 0:
+        if hasattr(module, 'reset_parameters'):
+            module.reset_parameters()
+        elif isinstance(module, MultiHeadAttention):
+            # manually reset the parameters of the MultiHeadAttention module
+            module = MultiHeadAttention(
+                input_size=module._input_size,
+                output_size=module._output_size,
+                d_k=module._d_k,
+                d_v=module._d_v,
+                nhead=module._nhead,
+                device=module._device,
+                dtype=module._dtype,
+                dropout_p=module.dropout_p,
+                softmax_scale=module.softmax_scale,
+                recompute=module.recompute,
+                init_gain=module.init_gain,
+                two_sets_of_queries=module.two_sets_of_queries,
+            )
+        return
+
+    for child in module.children():
+        reset_weights_recursively(child)
+
 class EasyTabPFNV2(nn.Module):
-    def __init__(self, seed: int = 42):
+    def __init__(self, pretrained=False, seed: int = 42):
         super().__init__()
         self.cls_model, _, _ = load_model_criterion_config(
             model_path="/home/jeremy/.cache/tabpfn/tabpfn-v2-classifier.ckpt",
@@ -47,6 +74,10 @@ class EasyTabPFNV2(nn.Module):
             model_seed=seed,
         )
         self.num_features = 100
+        
+        if not pretrained:
+            reset_weights_recursively(self.cls_model)
+            reset_weights_recursively(self.reg_model)
 
     def forward(
         self,
@@ -87,13 +118,13 @@ if __name__ == '__main__':
     X, y = load_breast_cancer(return_X_y=True)
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.33, random_state=42)
 
-    clf = EasyTabPFNV2("cls")
-    clf.to('cuda:0')
+    model = EasyTabPFNV2(pretrained=False)
+    model.to('cuda:0')
 
     X_train, X_test, y_train = torch.Tensor(X_train).unsqueeze(0), torch.Tensor(X_test).unsqueeze(0), torch.Tensor(y_train).unsqueeze(0)
     X_train, X_test, y_train = X_train.cuda(), X_test.cuda(), y_train.cuda()
 
-    prediction_logits = clf(torch.cat([X_train, X_test], dim=1), y_train, task="cls")
+    prediction_logits = model(torch.cat([X_train, X_test], dim=1), y_train, task="cls")
     prediction_probabilities = torch.nn.functional.softmax(prediction_logits[:, :, :2] / 0.9, dim=-1).squeeze(0)
     prediction_probabilities = prediction_probabilities.detach().cpu().numpy()
 
@@ -112,7 +143,7 @@ if __name__ == '__main__':
     X_train, X_test, y_train = torch.Tensor(X_train).unsqueeze(0), torch.Tensor(X_test).unsqueeze(0), torch.Tensor(y_train).unsqueeze(0)
     X_train, X_test, y_train = X_train.cuda(), X_test.cuda(), y_train.cuda()
 
-    prediction_logits = clf(torch.cat([X_train, X_test], dim=1), y_train, task="cls")
+    prediction_logits = model(torch.cat([X_train, X_test], dim=1), y_train, task="cls")
     prediction_probabilities = torch.nn.functional.softmax(prediction_logits[:, :, :len(torch.unique(y_train))] / 0.9, dim=-1).squeeze(0)
     prediction_probabilities = prediction_probabilities.detach().cpu().numpy()
 
@@ -134,12 +165,8 @@ if __name__ == '__main__':
 
     X_train, X_test, y_train = X_train.repeat(16, 1, 1), X_test.repeat(16, 1, 1), y_train.repeat(16, 1)
 
-    # Initialize a regressor
-    reg = EasyTabPFNV2("reg")
-    reg.to('cuda:0')
-
     # Predict a point estimate (using the mean)
-    predictions = reg(torch.cat([X_train, X_test], dim=1), y_train, task="reg").detach().cpu().numpy().squeeze()[0]
+    predictions = model(torch.cat([X_train, X_test], dim=1), y_train, task="reg").detach().cpu().numpy().squeeze()[0]
 
     print("Mean Squared Error (MSE):", mean_squared_error(y_test, predictions))
     print("Mean Absolute Error (MAE):", mean_absolute_error(y_test, predictions))
