@@ -5,28 +5,6 @@ from typing import Literal
 from tabpfn.model.bar_distribution import FullSupportBarDistribution
 from tabpfn.model.multi_head_attention import MultiHeadAttention
 
-class EasyBarDist(nn.Module):
-    def __init__(self, borders: torch.Tensor):
-        super().__init__()
-        self.borders = borders
-    
-    @property
-    def bucket_widths(self) -> torch.Tensor:
-        return self.borders[1:] - self.borders[:-1]
-
-    def mean(self, logits: torch.Tensor) -> torch.Tensor:
-        bucket_means = self.borders[:-1] + self.bucket_widths / 2
-        p = torch.softmax(logits, -1)
-        side_normals = (
-            FullSupportBarDistribution.halfnormal_with_p_weight_before(self.bucket_widths[0]),
-            FullSupportBarDistribution.halfnormal_with_p_weight_before(self.bucket_widths[-1]),
-        )
-        bucket_means[0] = -side_normals[0].mean + self.borders[1]
-        bucket_means[-1] = side_normals[1].mean + self.borders[-2]
-
-        return torch.einsum("lbc,cb->lb", p, bucket_means.to(logits.device).type(logits.dtype))
-
-
 def reset_weights_recursively(module):
     if len(list(module.children())) == 0:
         if hasattr(module, 'reset_parameters'):
@@ -56,16 +34,16 @@ class EasyTabPFNV2(nn.Module):
     def __init__(self, pretrained=False, seed: int = 42):
         super().__init__()
         self.cls_model, _, _ = load_model_criterion_config(
-            model_path="/home/jeremy/.cache/tabpfn/tabpfn-v2-classifier.ckpt",
+            model_path=".cache/tabpfn/tabpfn-v2-classifier.ckpt",
             check_bar_distribution_criterion=False,
             cache_trainset_representation=False,
             which="classifier",
             version="v2",
             download=True,
-            model_seed=42,
+            model_seed=seed,
         )
         self.reg_model, self.bardist_, _ = load_model_criterion_config(
-            model_path="/home/jeremy/.cache/tabpfn/tabpfn-v2-regressor.ckpt",
+            model_path=".cache/tabpfn/tabpfn-v2-regressor.ckpt",
             check_bar_distribution_criterion=True,
             cache_trainset_representation=False,
             which="regressor",
@@ -73,7 +51,6 @@ class EasyTabPFNV2(nn.Module):
             download=True,
             model_seed=seed,
         )
-        self.num_features = 100
         
         if not pretrained:
             reset_weights_recursively(self.cls_model)
@@ -84,29 +61,54 @@ class EasyTabPFNV2(nn.Module):
         x_src: torch.Tensor,
         y_src: torch.Tensor,
         task: Literal["cls", "reg"],  # classification or regression
+        return_logits: bool = False,
     ) -> torch.Tensor:
         eval_pos = y_src.shape[1]
         
         # switch from batch first to batch second
-        x_src, y_src = x_src.transpose(0, 1), y_src.transpose(0, 1).squeeze()
-        if task == "reg":
-            # Standardize y
-            mean = torch.mean(y_src, dim=0, keepdim=True)
-            std = torch.std(y_src, dim=0, keepdim=True)
-            y_src = (y_src - mean) / std
-            self.renormalized_criterion_ = EasyBarDist(
-                self.bardist_.borders[:, None] * std + mean,
-            )
+        x_src, y_src = x_src.transpose(0, 1), y_src.transpose(0, 1).squeeze(2)
         
-        model = self.cls_model if task == "cls" else self.reg_model
-        output = model(train_x=x_src[:eval_pos], train_y=y_src, test_x=x_src[eval_pos:])
-
         if task == "reg":
-            output = self.renormalized_criterion_.mean(output)
+            self.bar_dists_criteria = []
+            for b in range(x_src.shape[1]):
+                y_train_mean_ = torch.mean(y_src[:, b])
+                y_train_std_ = torch.std(y_src[:, b])
+                y_src[:, b] = (y_src[:, b] - y_train_mean_) / y_train_std_
+                self.bar_dists_criteria.append(FullSupportBarDistribution(
+                    self.bardist_.borders * y_train_std_ + y_train_mean_,
+                ).float())
+        
+        logits = self._forward(x_src, y_src, task, eval_pos)
+        
+        if task == "reg":
+            output = []
+            for b in range(x_src.shape[1]):
+                output.append(self.bar_dists_criteria[b].mean(logits[:, b]))
+            output = torch.stack(output, dim=1)
+        else:
+            output = logits
         
         output = output.transpose(0, 1)
+        if return_logits:
+            return output, logits.transpose(0, 1)
+        return output
+    
+    def _forward(
+        self, 
+        x_src: torch.Tensor, 
+        y_src: torch.Tensor, 
+        task: Literal["cls", "reg"],
+        eval_pos: int,
+    ) -> torch.Tensor:
+        model = self.cls_model if task == "cls" else self.reg_model
+        output = model(train_x=x_src[:eval_pos], train_y=y_src, test_x=x_src[eval_pos:])
         return output
 
+    def get_reg_loss(self, logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        result = []
+        for b in range(logits.shape[0]):
+            result.append(self.bar_dists_criteria[b](logits[b], y[b]))
+        return torch.stack(result, dim=0)
 
 if __name__ == '__main__':
     from sklearn.datasets import load_iris, load_breast_cancer, load_diabetes
@@ -166,7 +168,11 @@ if __name__ == '__main__':
     X_train, X_test, y_train = X_train.repeat(16, 1, 1), X_test.repeat(16, 1, 1), y_train.repeat(16, 1)
 
     # Predict a point estimate (using the mean)
-    predictions = model(torch.cat([X_train, X_test], dim=1), y_train, task="reg").detach().cpu().numpy().squeeze()[0]
+    predictions, logits = model(torch.cat([X_train, X_test], dim=1), y_train, task="reg", return_logits=True)
+    predictions = predictions.detach().cpu().numpy().squeeze()[0]
+    
+    loss = model.get_reg_loss(logits, torch.Tensor(y_test).unsqueeze(0).repeat(16, 1).cuda())
+    print(f'Mean Loss: {loss.mean().item()}')
 
     print("Mean Squared Error (MSE):", mean_squared_error(y_test, predictions))
     print("Mean Absolute Error (MAE):", mean_absolute_error(y_test, predictions))
