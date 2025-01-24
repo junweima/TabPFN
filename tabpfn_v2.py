@@ -51,6 +51,7 @@ class EasyTabPFNV2(nn.Module):
             download=True,
             model_seed=seed,
         )
+        self.num_features = None
         
         if not pretrained:
             reset_weights_recursively(self.cls_model)
