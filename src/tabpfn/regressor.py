@@ -64,6 +64,8 @@ from tabpfn.utils import (
     validate_Xy_fit,
 )
 
+from tabpfn.model.transformer import PerFeatureTransformer
+
 if TYPE_CHECKING:
     import numpy.typing as npt
     from sklearn.compose import ColumnTransformer
@@ -379,7 +381,7 @@ class TabPFNRegressor(RegressorMixin, BaseEstimator):
         tags.estimator_type = "regressor"
         return tags
 
-    def fit(self, X: XType, y: YType) -> Self:
+    def fit(self, X: XType, y: YType, model: PerFeatureTransformer = None) -> Self:
         """Fit the model.
 
         Args:
@@ -398,6 +400,9 @@ class TabPFNRegressor(RegressorMixin, BaseEstimator):
             fit_mode=self.fit_mode,
             static_seed=static_seed,
         )
+
+        if model is not None:
+            self.model_ = model
 
         # Determine device and precision
         self.device_ = infer_device_and_type(self.device)
